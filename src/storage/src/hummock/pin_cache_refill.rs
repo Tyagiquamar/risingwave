@@ -97,7 +97,7 @@ pub(crate) struct PinCacheRefillController {
     executor: PinCacheRefillExecutor,
     pinned_table_ids: HashSet<TableId>,
     object_ref_counts: HashMap<HummockSstableObjectId, u32>,
-    pub(crate) planning_version: PinnedVersion,
+    planning_version: PinnedVersion,
 }
 
 impl PinCacheRefillController {
@@ -114,6 +114,10 @@ impl PinCacheRefillController {
             object_ref_counts: HashMap::new(),
             planning_version,
         }
+    }
+
+    pub(crate) fn planning_version(&self) -> &PinnedVersion {
+        &self.planning_version
     }
 
     /// Advances the planning version and returns `(candidates, membership_changes)`.

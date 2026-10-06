@@ -16,14 +16,15 @@ use bytes::Bytes;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::util::epoch::test_epoch;
+use risingwave_hummock_sdk::compaction_group::group_split::build_split_key;
 use risingwave_hummock_sdk::key::{FullKey, UserKey, prefix_slice_with_vnode};
 use risingwave_hummock_sdk::sstable_info::SstableInfoInner;
 use risingwave_hummock_sdk::version::{GroupDeltas, IntraLevelDelta};
 use risingwave_hummock_sdk::{CompactionGroupId, EpochWithGap};
 use risingwave_pb::hummock::hummock_version::Levels;
 use risingwave_pb::hummock::{
-    HummockVersion as PbHummockVersion, Level, OverlappingLevel, StateTableInfo,
-    StateTableInfoDelta,
+    CompactionConfig, CompatibilityVersion, GroupConstruct, HummockVersion as PbHummockVersion,
+    Level, OverlappingLevel, StateTableInfo, StateTableInfoDelta,
 };
 use tokio::sync::{Semaphore, mpsc};
 
@@ -145,6 +146,8 @@ fn intra_level_delta(deleted: &[SstableInfo], inserted: &[SstableInfo]) -> Hummo
 async fn test_membership_tracks_physical_references() {
     let (store, cache) = with_pin_cache(mock_sstable_store().await, u64::MAX).await;
     let tables = [TableId::from(233), TableId::from(234)];
+    let (_, cross_table_sst) =
+        sst_with_vnodes(&store, 1002, &[(tables[0], 0), (tables[1], 0)]).await;
     let branches = tables.map(|table| {
         SstableInfo::from(SstableInfoInner {
             object_id: 1001.into(),
@@ -285,6 +288,80 @@ async fn test_membership_tracks_physical_references() {
             assert_eq!(changes.removed, [1001.into()].into());
             assert!(changes.inserted.is_empty());
         }
+    }
+
+    // A real group split creates two logical references to one physical object.
+    // Subsequent ordinary deletions must retain it until the final reference disappears.
+    let snapshot = version_with_ssts(&[cross_table_sst]);
+    let (candidates, changes) = controller.apply_version_update(&[], snapshot.clone(), None);
+    assert!(candidates.is_empty() && changes.removed.is_empty());
+    assert_eq!(changes.inserted, [1002.into()].into());
+    let mut version = (*snapshot).clone();
+    let mut split = HummockVersionDelta::default();
+    split.group_deltas.insert(
+        2.into(),
+        GroupDeltas {
+            group_deltas: vec![GroupDelta::GroupConstruct(Box::new(GroupConstruct {
+                parent_group_id: 1.into(),
+                group_id: 2.into(),
+                new_sst_start_id: 900.into(),
+                version: CompatibilityVersion::SplitGroupByTableId as i32,
+                split_key: Some(build_split_key(tables[1], VirtualNode::ZERO).to_vec()),
+                group_config: Some(CompactionConfig {
+                    max_level: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))],
+        },
+    );
+    split.state_table_info_delta.insert(
+        tables[1],
+        StateTableInfoDelta {
+            compaction_group_id: 2.into(),
+            ..Default::default()
+        },
+    );
+    let mut raw_deltas = [split, HummockVersionDelta::default()];
+    for delta in &mut raw_deltas {
+        delta.prev_id = version.id;
+        delta.id = (version.id.as_raw_id() + 1).into();
+        assert!(version.build_sst_delta_infos(delta).is_empty());
+        version.apply_version_delta(delta);
+    }
+    let (candidates, changes) = controller.apply_version_update(
+        &[],
+        PinnedVersion::new(version.clone(), mpsc::unbounded_channel().0),
+        Some(&raw_deltas),
+    );
+    assert!(candidates.is_empty() && changes.inserted.is_empty() && changes.removed.is_empty());
+    for group_id in [CompactionGroupId::new(1), CompactionGroupId::new(2)] {
+        let branch = &version.levels[&group_id].l0.sub_levels[0].table_infos[0];
+        assert_eq!(branch.object_id, 1002);
+        let mut delta = intra_level_delta(std::slice::from_ref(branch), &[]);
+        let group_delta = delta
+            .group_deltas
+            .remove(&CompactionGroupId::new(1))
+            .unwrap();
+        delta.group_deltas.insert(group_id, group_delta);
+        delta.prev_id = version.id;
+        delta.id = (version.id.as_raw_id() + 1).into();
+        let sst_deltas = version.build_sst_delta_infos(&delta);
+        version.apply_version_delta(&delta);
+        let (candidates, changes) = controller.apply_version_update(
+            &sst_deltas,
+            PinnedVersion::new(version.clone(), mpsc::unbounded_channel().0),
+            Some(&[delta]),
+        );
+        assert!(candidates.is_empty() && changes.inserted.is_empty());
+        assert_eq!(
+            changes.removed,
+            if group_id == 2 {
+                [1002.into()].into()
+            } else {
+                HashSet::new()
+            }
+        );
     }
 }
 
